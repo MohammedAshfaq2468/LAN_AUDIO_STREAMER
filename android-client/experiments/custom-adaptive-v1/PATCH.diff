@@ -1,0 +1,933 @@
+--- a/AudioStreamingService.kt
++++ b/AudioStreamingService.kt
+@@ -103,6 +103,8 @@
+         @JvmStatic external fun nativeServiceSetHighBufferProfile(enabled: Boolean): Boolean
+         @JvmStatic external fun nativeServiceSetMediumBufferProfile(enabled: Boolean): Boolean
+         @JvmStatic external fun nativeServiceSetLowBufferProfile(enabled: Boolean): Boolean
++        @JvmStatic external fun nativeServiceSetCustomBufferProfile(enabled: Boolean, targetMs: Int): Boolean
++        @JvmStatic external fun nativeServiceGetCustomBufferRingDrops(): Long
+         @JvmStatic external fun nativeServiceGetBufferStats(stats: IntArray): Boolean
+         @JvmStatic external fun nativeServiceSendHandshake(mfg: String, mdl: String, dev: String): String?
+ 
+@@ -371,6 +373,13 @@
+     @Volatile private var lastHighBufferGapLogAtMs = 0L
+     private var lastMediumBufferGapLogAtMs = 0L
+     @Volatile private var lowLipSyncSkippedBlocks = 0L
++    @Volatile private var customStaleBlocksSkipped = 0L
++    @Volatile private var cachedCustomBufferDecision: CustomBufferEngine.Decision? = null
++    @Volatile private var lastCustomDecisionRefreshAtMs = 0L
++    @Volatile private var customProcessCpuPercent = 0
++    private var lastCustomCpuWallAtMs = 0L
++    private var lastCustomProcessCpuMs = 0L
++    private val customDecisionLock = Any()
+     @Volatile private var lastStreamExceptionLogAtMs = 0L
+     @Volatile private var audioTrackRebuildRequested = false
+ 
+@@ -482,6 +491,13 @@
+         nativeServiceSetLowBufferProfile(
+             bufferModeKey == BufferModeConfig.Mode.LOW.key
+         )
++        nativeServiceSetCustomBufferProfile(
++            bufferModeKey == BufferModeConfig.Mode.CUSTOM.key,
++            customBufferMs
++        )
++        if (bufferModeKey == BufferModeConfig.Mode.CUSTOM.key) {
++            currentCustomBufferDecision(forceRefresh = true)
++        }
+ 
+         // 🛜 CRITICAL:
+         // The foreground Service owns persistent network routing.
+@@ -1395,6 +1411,15 @@
+             nativeServiceSetHighBufferProfile(isHighBuffer)
+             nativeServiceSetMediumBufferProfile(isMediumBuffer)
+             nativeServiceSetLowBufferProfile(isLowBuffer)
++            nativeServiceSetCustomBufferProfile(
++                savedSelection.mode == BufferModeConfig.Mode.CUSTOM,
++                customBufferMs
++            )
++            cachedCustomBufferDecision = null
++            lastCustomDecisionRefreshAtMs = 0L
++            if (savedSelection.mode == BufferModeConfig.Mode.CUSTOM) {
++                currentCustomBufferDecision(forceRefresh = true)
++            }
+             val profileChanged = previousBufferModeKey != bufferModeKey
+             val bufferValueChanged = previousBufferMs != appliedMs
+             if (isConnected && shouldStream) {
+@@ -1412,11 +1437,14 @@
+                     applyAudioTrackBufferPolicy()
+                 }
+                 sendBufferProfileTelemetryNow(currentServerAddress.substringBefore(":").trim())
++                if (savedSelection.mode == BufferModeConfig.Mode.CUSTOM) {
++                    refreshCustomNetworkStateAsync("slider release")
++                }
+             }
+             updateNotification("🎛️ ${savedSelection.mode.title}: ${jitterBufferMs}ms")
+             Log.i(
+                 TAG,
+-                "🎚️ Streaming profile=${when { isUltraLow -> "golden_ultra_low_v1"; isHighBuffer -> "high_continuity_v1"; isMediumBuffer -> "medium_balanced_v1"; isLowBuffer -> "low_lipsync_v1"; else -> "adaptive_v2" }}, " +
++                "🎚️ Streaming profile=${when { isUltraLow -> "golden_ultra_low_v1"; isHighBuffer -> "high_continuity_v1"; isMediumBuffer -> "medium_balanced_v1"; isLowBuffer -> "low_lipsync_v1"; savedSelection.mode == BufferModeConfig.Mode.CUSTOM -> CustomBufferEngine.PROFILE; else -> "adaptive_v2" }}, " +
+                     "mode=${savedSelection.mode.key}, buffer=${appliedMs}ms"
+             )
+             return START_STICKY
+@@ -2001,6 +2029,15 @@
+                 nativeServiceSetLowBufferProfile(
+                     bufferModeKey == BufferModeConfig.Mode.LOW.key
+                 )
++                nativeServiceSetCustomBufferProfile(
++                    bufferModeKey == BufferModeConfig.Mode.CUSTOM.key,
++                    customBufferMs
++                )
++                if (bufferModeKey == BufferModeConfig.Mode.CUSTOM.key) {
++                    cachedCustomBufferDecision = null
++                    lastCustomDecisionRefreshAtMs = 0L
++                    currentCustomBufferDecision(forceRefresh = true)
++                }
+                 updateNotification(" 🤝 Connected to endpoint - validating server… ")
+ 
+                 /*isConnected = true
+@@ -2139,6 +2176,7 @@
+                 val telemetryServerIp = currentServerAddress.substringBefore(":").trim()
+                 if (telemetryServerIp.isNotBlank()) {
+                     networkQuality = assessNetworkQuality(telemetryServerIp)
++                    if (bufferModeKey == BufferModeConfig.Mode.CUSTOM.key) currentCustomBufferDecision()
+                     updateNotification("\uD83D\uDEDC Connected to $serverDisplayName")
+                 }
+ 
+@@ -2187,6 +2225,12 @@
+                             }
+                             val stats = getConnectionStats()
+                             val audioTrackHardwareUnderruns = getAudioTrackHardwareUnderruns()
++                            val customDecision = if (bufferModeKey == BufferModeConfig.Mode.CUSTOM.key) {
++                                currentCustomBufferDecision()
++                            } else null
++                            val customNativeRingDrops = if (bufferModeKey == BufferModeConfig.Mode.CUSTOM.key) {
++                                try { nativeServiceGetCustomBufferRingDrops() } catch (_: Throwable) { -1L }
++                            } else 0L
+                             // Read volatile live settings on every report. Do not
+                             // capture the bufferMs argument from connection startup:
+                             // otherwise server telemetry stays stale after a live switch.
+@@ -2197,6 +2241,7 @@
+                                 BufferModeConfig.Mode.HIGH.key -> "high_continuity_v1"
+                                 BufferModeConfig.Mode.MEDIUM.key -> "medium_balanced_v1"
+                                 BufferModeConfig.Mode.LOW.key -> "low_lipsync_v1"
++                                BufferModeConfig.Mode.CUSTOM.key -> CustomBufferEngine.PROFILE
+                                 else -> "adaptive_v2"
+                             }
+                             val syncScore = (100
+@@ -2216,6 +2261,15 @@
+                             obj.put("buffer_mode", activeModeKey)
+                             obj.put("buffer_ms", activeBufferMs)
+                             obj.put("streaming_profile", streamingProfile)
++                            obj.put("custom_buffer_ms", if (activeModeKey == BufferModeConfig.Mode.CUSTOM.key) customBufferMs else 0)
++                            obj.put("custom_effective_ms", customDecision?.effectiveTargetMs ?: 0)
++                            obj.put("custom_network_margin_ms", customDecision?.networkMarginMs ?: 0)
++                            obj.put("custom_device_penalty_ms", customDecision?.devicePenaltyMs ?: 0)
++                            obj.put("custom_device_cpu_percent", customProcessCpuPercent)
++                            obj.put("custom_low_watermark_ms", customDecision?.lowWatermarkMs ?: 0)
++                            obj.put("custom_high_watermark_ms", customDecision?.highWatermarkMs ?: 0)
++                            obj.put("custom_stale_blocks_skipped", customStaleBlocksSkipped)
++                            obj.put("custom_native_ring_drops", customNativeRingDrops)
+                             obj.put("low_lipsync_skipped_blocks", lowLipSyncSkippedBlocks)
+                             obj.put("packets_received", stats.packetsReceived)
+                             obj.put("packets_dropped", stats.packetsDropped)
+@@ -2228,7 +2282,7 @@
+                             val packet = DatagramPacket(data, data.size, InetAddress.getByName(telemetryServerIp), 50009)
+                             telemetrySocket.send(packet)
+ 
+-                            Thread.sleep(30000)
++                            Thread.sleep(if (bufferModeKey == BufferModeConfig.Mode.CUSTOM.key) 10_000L else 30_000L)
+                         }
+                     } catch (e: java.lang.InterruptedException) {
+                         // Expected when stopTelemetryThread() interrupts a
+@@ -2316,6 +2370,7 @@
+         val isHighBuffer = bufferModeKey == BufferModeConfig.Mode.HIGH.key
+         val isMediumBuffer = bufferModeKey == BufferModeConfig.Mode.MEDIUM.key
+         val isLowBuffer = bufferModeKey == BufferModeConfig.Mode.LOW.key
++        val isCustomBuffer = bufferModeKey == BufferModeConfig.Mode.CUSTOM.key
+         val requestedBufferedMs = when {
+             isHighBuffer -> jitterBufferMs.coerceAtLeast(1500)
+             isMediumBuffer -> 250
+@@ -2374,7 +2429,7 @@
+ 
+         // Low and Medium start after a small real-PCM pre-roll. This avoids the
+         // launch-time underrun burst while keeping Low's added startup delay bounded.
+-        if (!isMediumBuffer && !isLowBuffer) audioTrack?.play()
++        if (!isMediumBuffer && !isLowBuffer && !isCustomBuffer) audioTrack?.play()
+ 
+         // MainActivity's volume slider controls Android STREAM_MUSIC globally.
+         // AudioTrack stays at unity gain except for explicit mute and focus ducking.
+@@ -2384,6 +2439,7 @@
+             isHighBuffer -> "high_continuity_v1"
+             isMediumBuffer -> "medium_balanced_v1"
+             isLowBuffer -> "low_lipsync_v1"
++            isCustomBuffer -> CustomBufferEngine.PROFILE
+             bufferModeKey == BufferModeConfig.Mode.ULTRA_LOW.key -> "golden_ultra_low_v1"
+             else -> "adaptive_v2"
+         }
+@@ -3281,6 +3337,7 @@
+                 BufferModeConfig.Mode.HIGH.key -> "High continuity"
+                 BufferModeConfig.Mode.MEDIUM.key -> "Medium balanced"
+                 BufferModeConfig.Mode.LOW.key -> "Low lip-sync"
++                BufferModeConfig.Mode.CUSTOM.key -> "Custom adaptive (HAL-minimum hardware queue)"
+                 else -> "adaptive"
+             }
+             val actualFrames = track.bufferSizeInFrames
+@@ -3294,6 +3351,126 @@
+         } catch (e: IllegalStateException) {
+             Log.w(TAG, "⚠️ AudioTrack buffer policy update skipped: ${e.message}")
+         }
++    }
++
++    /**
++     * Estimate receiver headroom from cheap local device signals. This is a guard
++     * term, not a benchmark or a claim that CPU/RAM fully characterize a phone.
++     */
++    @Suppress("NewApi")
++    private fun estimateCustomDevicePenaltyMs(): Int {
++        val cores = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
++        var penalty = when {
++            cores <= 4 -> 20
++            cores <= 6 -> 10
++            else -> 0
++        }
++        // Process CPU is sampled once per controller refresh and normalized by
++        // logical cores; this is a load hint, not a hardware benchmark.
++        try {
++            val wallNow = SystemClock.elapsedRealtime()
++            val cpuNow = android.os.Process.getElapsedCpuTime()
++            if (lastCustomCpuWallAtMs > 0L && wallNow > lastCustomCpuWallAtMs) {
++                val wallDelta = wallNow - lastCustomCpuWallAtMs
++                val cpuDelta = (cpuNow - lastCustomProcessCpuMs).coerceAtLeast(0L)
++                customProcessCpuPercent = ((cpuDelta * 100L) / (wallDelta * cores)).toInt().coerceIn(0, 100)
++            }
++            lastCustomCpuWallAtMs = wallNow
++            lastCustomProcessCpuMs = cpuNow
++            penalty += when {
++                customProcessCpuPercent >= 80 -> 25
++                customProcessCpuPercent >= 60 -> 12
++                else -> 0
++            }
++        } catch (_: Throwable) { }
++        try {
++            val manager = getSystemService(Context.ACTIVITY_SERVICE) as? android.app.ActivityManager
++            val memory = android.app.ActivityManager.MemoryInfo()
++            manager?.getMemoryInfo(memory)
++            if (memory.availMem < 512L * 1024L * 1024L) penalty += 25
++            else if (memory.availMem < 1024L * 1024L * 1024L) penalty += 10
++        } catch (_: Throwable) { }
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
++            try {
++                val power = getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
++                penalty += when (power?.currentThermalStatus) {
++                    android.os.PowerManager.THERMAL_STATUS_SEVERE,
++                    android.os.PowerManager.THERMAL_STATUS_CRITICAL,
++                    android.os.PowerManager.THERMAL_STATUS_EMERGENCY,
++                    android.os.PowerManager.THERMAL_STATUS_SHUTDOWN -> 80
++                    android.os.PowerManager.THERMAL_STATUS_MODERATE -> 35
++                    android.os.PowerManager.THERMAL_STATUS_LIGHT -> 10
++                    else -> 0
++                }
++            } catch (_: Throwable) { }
++        }
++        return penalty.coerceIn(0, 120)
++    }
++
++    /** Run one immediate route assessment after the user releases the Custom slider. */
++    private fun refreshCustomNetworkStateAsync(reason: String) {
++        val serverIp = currentServerAddress.substringBefore(":").trim()
++        if (serverIp.isBlank() || !isConnected || bufferModeKey != BufferModeConfig.Mode.CUSTOM.key) return
++        serviceIoScope.launch(Dispatchers.IO) {
++            try {
++                val measured = assessNetworkQuality(serverIp)
++                if (!isConnected || bufferModeKey != BufferModeConfig.Mode.CUSTOM.key) return@launch
++                networkQuality = measured
++                cachedCustomBufferDecision = null
++                lastCustomDecisionRefreshAtMs = 0L
++                val decision = currentCustomBufferDecision(forceRefresh = true)
++                Log.i(
++                    TAG,
++                    "🧠 Custom network refresh ($reason): RTT=${measured.latency}ms, jitter=${"%.1f".format(measured.jitter)}ms, " +
++                        "effective=${decision.effectiveTargetMs}ms, watermarks=${decision.lowWatermarkMs}/${decision.highWatermarkMs}ms"
++                )
++                sendBufferProfileTelemetryNow(serverIp)
++            } catch (e: Exception) {
++                Log.w(TAG, "⚠️ Custom network refresh failed ($reason): ${e.message}")
++            }
++        }
++    }
++
++    /** Recompute at most once per second; the audio loop only reads the cached policy. */
++    private fun currentCustomBufferDecision(forceRefresh: Boolean = false): CustomBufferEngine.Decision {
++        val now = SystemClock.elapsedRealtime()
++        val existing = cachedCustomBufferDecision
++        if (!forceRefresh && existing != null && now - lastCustomDecisionRefreshAtMs < 1_000L) {
++            return existing
++        }
++        synchronized(customDecisionLock) {
++            val secondCheck = cachedCustomBufferDecision
++            val lockedNow = SystemClock.elapsedRealtime()
++            if (!forceRefresh && secondCheck != null && lockedNow - lastCustomDecisionRefreshAtMs < 1_000L) {
++                return secondCheck
++            }
++            val decision = CustomBufferEngine.decide(
++                requestedMs = customBufferMs,
++                rttMs = networkQuality.latency,
++                jitterMs = networkQuality.jitter,
++                devicePenaltyMs = estimateCustomDevicePenaltyMs()
++            )
++            cachedCustomBufferDecision = decision
++            lastCustomDecisionRefreshAtMs = lockedNow
++            return decision
++        }
++    }
++
++    private suspend fun awaitCustomPcmPreroll(
++        decision: CustomBufferEngine.Decision,
++        timeoutOverrideMs: Long? = null
++    ): Int {
++        val targetSamples = (decision.preRollTargetMs * sampleRate) / 1000
++        val timeoutMs = timeoutOverrideMs ?: decision.preRollTimeoutMs
++        val deadline = SystemClock.elapsedRealtime() + timeoutMs
++        var bufferedSamples = 0
++        while (shouldStream && isConnected && SystemClock.elapsedRealtime() < deadline) {
++            val stats = IntArray(4)
++            if (nativeServiceGetBufferStats(stats)) bufferedSamples = stats[3]
++            if (bufferedSamples >= targetSamples) break
++            delay(5L)
++        }
++        return bufferedSamples
+     }
+ 
+     /**
+@@ -3322,8 +3499,15 @@
+             BufferModeConfig.Mode.HIGH.key -> "high_continuity_v1"
+             BufferModeConfig.Mode.MEDIUM.key -> "medium_balanced_v1"
+             BufferModeConfig.Mode.LOW.key -> "low_lipsync_v1"
++            BufferModeConfig.Mode.CUSTOM.key -> CustomBufferEngine.PROFILE
+             else -> "adaptive_v2"
+         }
++        val customDecision = if (modeKey == BufferModeConfig.Mode.CUSTOM.key) {
++            currentCustomBufferDecision()
++        } else null
++        val customNativeRingDrops = if (modeKey == BufferModeConfig.Mode.CUSTOM.key) {
++            try { nativeServiceGetCustomBufferRingDrops() } catch (_: Throwable) { -1L }
++        } else 0L
+         val payload = try {
+             val stats = try { getConnectionStats() } catch (_: Throwable) {
+                 ConnectionStats(0, 0, 0, 0)
+@@ -3340,6 +3524,15 @@
+                 put("buffer_mode", modeKey)
+                 put("buffer_ms", activeBufferMs)
+                 put("streaming_profile", streamingProfile)
++                put("custom_buffer_ms", if (modeKey == BufferModeConfig.Mode.CUSTOM.key) customBufferMs else 0)
++                put("custom_effective_ms", customDecision?.effectiveTargetMs ?: 0)
++                put("custom_network_margin_ms", customDecision?.networkMarginMs ?: 0)
++                put("custom_device_penalty_ms", customDecision?.devicePenaltyMs ?: 0)
++                put("custom_device_cpu_percent", customProcessCpuPercent)
++                put("custom_low_watermark_ms", customDecision?.lowWatermarkMs ?: 0)
++                put("custom_high_watermark_ms", customDecision?.highWatermarkMs ?: 0)
++                put("custom_stale_blocks_skipped", customStaleBlocksSkipped)
++                put("custom_native_ring_drops", customNativeRingDrops)
+                 put("low_lipsync_skipped_blocks", lowLipSyncSkippedBlocks)
+                 put("packets_received", stats.packetsReceived)
+                 put("packets_dropped", stats.packetsDropped)
+@@ -3538,6 +3731,14 @@
+                     Log.i(TAG, "🎯 Low pre-roll: ${bufferedSamples} samples (~${bufferedSamples * 1000 / sampleRate}ms) / target 60ms; startup PCM retained")
+                     if (bufferedSamples < targetSamples) {
+                         Log.w(TAG, "⚠️ Low 60ms pre-roll not reached within 1.5s; starting with available PCM")
++                    }
++                }
++                BufferModeConfig.Mode.CUSTOM.key -> {
++                    val decision = currentCustomBufferDecision(forceRefresh = true)
++                    val bufferedSamples = awaitCustomPcmPreroll(decision)
++                    Log.i(TAG, "🧠 Custom pre-roll: ${bufferedSamples} samples (~${bufferedSamples * 1000 / sampleRate}ms) / target ${decision.preRollTargetMs}ms, requested=${decision.requestedMs}ms, timeout=${decision.preRollTimeoutMs}ms")
++                    if (bufferedSamples < (decision.preRollTargetMs * sampleRate) / 1000) {
++                        Log.w(TAG, "⚠️ Custom pre-roll target not reached before timeout; starting with available real PCM")
+                     }
+                 }
+                 else -> {
+@@ -3563,10 +3764,16 @@
+             }
+ 
+             if ((bufferModeKey == BufferModeConfig.Mode.MEDIUM.key ||
+-                    bufferModeKey == BufferModeConfig.Mode.LOW.key) &&
++                    bufferModeKey == BufferModeConfig.Mode.LOW.key ||
++                    bufferModeKey == BufferModeConfig.Mode.CUSTOM.key) &&
+                 track.playState != AudioTrack.PLAYSTATE_PLAYING) {
+                 track.play()
+-                Log.i(TAG, "▶️ ${if (bufferModeKey == BufferModeConfig.Mode.LOW.key) "Low" else "Medium"} AudioTrack started after real-PCM pre-roll")
++                val label = when (bufferModeKey) {
++                    BufferModeConfig.Mode.LOW.key -> "Low"
++                    BufferModeConfig.Mode.MEDIUM.key -> "Medium"
++                    else -> "Custom"
++                }
++                Log.i(TAG, "▶️ $label AudioTrack started after real-PCM pre-roll")
+             }
+ 
+             while (shouldStream && isConnected) {
+@@ -3601,6 +3808,13 @@
+                             fastForwardAboveSinceMs = 0L
+                             val bufferedSamples = awaitLowPcmPreroll()
+                             Log.i(TAG, "🎯 Low mode switch pre-roll: ${bufferedSamples} samples (~${bufferedSamples * 1000 / sampleRate}ms)")
++                            if (track.playState != AudioTrack.PLAYSTATE_PLAYING) track.play()
++                        } else if (bufferModeKey == BufferModeConfig.Mode.CUSTOM.key) {
++                            fastForwardActive = false
++                            fastForwardAboveSinceMs = 0L
++                            val decision = currentCustomBufferDecision(forceRefresh = true)
++                            val bufferedSamples = awaitCustomPcmPreroll(decision)
++                            Log.i(TAG, "🧠 Custom mode switch pre-roll: ${bufferedSamples} samples (~${bufferedSamples * 1000 / sampleRate}ms) / target=${decision.preRollTargetMs}ms")
+                             if (track.playState != AudioTrack.PLAYSTATE_PLAYING) track.play()
+                         }
+                         Log.i(TAG, "✅ AudioTrack reconfigured at a frame boundary for ${bufferModeKey}")
+@@ -3657,7 +3871,11 @@
+                         // repeated 10ms stale-frame deletion. We still cap the queue tightly
+                         // enough to prevent an unbounded latency drift.
+                         val measuredJitterMs = networkQuality.jitter.toInt().coerceAtLeast(0)
++                        val customPolicy = if (bufferModeKey == BufferModeConfig.Mode.CUSTOM.key) {
++                            currentCustomBufferDecision()
++                        } else null
+                         val highWatermarkMs = when {
++                            bufferModeKey == BufferModeConfig.Mode.CUSTOM.key -> customPolicy!!.highWatermarkMs
+                             bufferModeKey == BufferModeConfig.Mode.MEDIUM.key ->
+                                 (600 + measuredJitterMs * 2).coerceIn(600, 800)
+                             bufferModeKey == BufferModeConfig.Mode.LOW.key ->
+@@ -3669,6 +3887,7 @@
+                                 (jitterBufferMs + 200).coerceAtMost(1800)
+                         }
+                         val lowWatermarkMs = when {
++                            bufferModeKey == BufferModeConfig.Mode.CUSTOM.key -> customPolicy!!.lowWatermarkMs
+                             bufferModeKey == BufferModeConfig.Mode.MEDIUM.key ->
+                                 (highWatermarkMs - 250).coerceAtLeast(350)
+                             bufferModeKey == BufferModeConfig.Mode.LOW.key ->
+@@ -3697,6 +3916,7 @@
+                                         val severeBacklogMs = (nativeBufferLevelSamples * 1000L) / sampleRate
+                                         if (severeBacklogMs >= 500L) 350L else 650L
+                                     }
++                                    bufferModeKey == BufferModeConfig.Mode.CUSTOM.key -> customPolicy!!.persistenceMs
+                                     jitterBufferMs <= 10 -> 350L
+                                     else -> 600L
+                                 }
+@@ -3720,15 +3940,20 @@
+                             } else {
+                                 if (bufferModeKey == BufferModeConfig.Mode.LOW.key) {
+                                     lowLipSyncSkippedBlocks++
++                                } else if (bufferModeKey == BufferModeConfig.Mode.CUSTOM.key) {
++                                    customStaleBlocksSkipped++
+                                 }
+-                                val fastForwardLogIntervalMs =
+-                                    if (bufferModeKey == BufferModeConfig.Mode.LOW.key) 3000L else 500L
++                                val fastForwardLogIntervalMs = when (bufferModeKey) {
++                                    BufferModeConfig.Mode.LOW.key -> 3000L
++                                    BufferModeConfig.Mode.CUSTOM.key -> 3000L
++                                    else -> 500L
++                                }
+                                 if (nowMs - lastFastForwardLogMs >= fastForwardLogIntervalMs) {
+                                     lastFastForwardLogMs = nowMs
+                                     Log.w(
+                                         TAG,
+                                         "⏩ FAST-FORWARD: Native buffer = $nativeBufferLevelSamples samples; target <= ${lowWatermarkSamples} (${lowWatermarkMs}ms). " +
+-                                            "Skipped=${if (bufferModeKey == BufferModeConfig.Mode.LOW.key) lowLipSyncSkippedBlocks else "n/a"}; stale playback blocks are being skipped to preserve lip-sync."
++                                            "Skipped=${when (bufferModeKey) { BufferModeConfig.Mode.LOW.key -> lowLipSyncSkippedBlocks; BufferModeConfig.Mode.CUSTOM.key -> customStaleBlocksSkipped; else -> "n/a" }}; stale playback blocks are being skipped to preserve lip-sync."
+                                     )
+                                 }
+                                 continue
+@@ -3895,11 +4120,14 @@
+                     // impossible values such as 110% or 500%. Keep it as a raw count.
+                     val underrunCount = stats.bufferUnderruns
+ 
+-                    // Only ping every 30s
+-                    if (loopCount % 10 == 1) {
++                    // Custom re-measures its route about every 9s (3s monitor x 3).
++                    // Other profiles retain the established 30s measurement cadence.
++                    val pingCadenceLoops = if (bufferModeKey == BufferModeConfig.Mode.CUSTOM.key) 3 else 10
++                    if (loopCount % pingCadenceLoops == 1) {
+                         val serverIp = currentServerAddress.substringBefore(":").trim()
+                         if (serverIp.isNotBlank()) {
+                             networkQuality = assessNetworkQuality(serverIp)
++                            if (bufferModeKey == BufferModeConfig.Mode.CUSTOM.key) currentCustomBufferDecision()
+                         }
+                         Log.i(TAG, "📊 Performance: Connected ${connectionDuration/1000}s, Drop: ${dropRate}%, Underruns: ${underrunCount}"  +
+                                 "Network: ${networkQuality.signalQuality}, RTT=${networkQuality.latency}ms,Jitter=${"%.1f".format(networkQuality.jitter)}ms")
+
+--- a/wifi_audio_native.cpp
++++ b/wifi_audio_native.cpp
+@@ -79,6 +79,13 @@
+ static std::atomic<bool> low_buffer_profile{false};
+ static std::atomic<bool> medium_buffer_profile{false};
+ static std::atomic<bool> high_buffer_profile{false};
++static std::atomic<bool> custom_buffer_profile{false};
++static std::atomic<int> custom_buffer_target_ms{500};
++static std::atomic<uint64_t> custom_buffer_ring_drops{0};
++static size_t custom_ring_capacity_for_target_ms(int target_ms) {
++    const int capacity_ms = std::max(1500, std::min(3000, target_ms + 1000));
++    return static_cast<size_t>(SAMPLE_RATE) * static_cast<size_t>(capacity_ms) / 1000U;
++}
+ static size_t active_ring_buffer_capacity = RING_BUFFER_SIZE; // Protected by ring_buffer_mutex.
+ static int16_t* ring_buffer = nullptr;
+ static size_t ring_write_pos = 0;
+@@ -131,14 +138,16 @@
+             ? GOLDEN_ULTRA_LOW_RING_BUFFER_SIZE
+             : (high_buffer_profile.load() ? HIGH_BUFFER_RING_BUFFER_SIZE
+                : (medium_buffer_profile.load() ? MEDIUM_BUFFER_RING_BUFFER_SIZE
+-                  : (low_buffer_profile.load() ? LOW_BUFFER_RING_BUFFER_SIZE : RING_BUFFER_SIZE)));
++                  : (low_buffer_profile.load() ? LOW_BUFFER_RING_BUFFER_SIZE
++                     : (custom_buffer_profile.load() ? custom_ring_capacity_for_target_ms(custom_buffer_target_ms.load()) : RING_BUFFER_SIZE))));
+     memset(ring_buffer, 0, RING_BUFFER_ALLOCATION_SIZE * sizeof(int16_t));
+     ring_write_pos = ring_read_pos = ring_used = 0;
+ 
+     const char *ringProfile = golden_ultra_low_profile.load() ? "Golden Ultra Low"
+             : (high_buffer_profile.load() ? "High continuity"
+                : (medium_buffer_profile.load() ? "Medium balanced"
+-                  : (low_buffer_profile.load() ? "Low lip-sync" : "adaptive")));
++                  : (low_buffer_profile.load() ? "Low lip-sync"
++                     : (custom_buffer_profile.load() ? "Custom adaptive" : "adaptive"))));
+     LOGI("Ring buffer initialized: active=%zu / allocated=%zu samples (%s profile)",
+          active_ring_buffer_capacity, RING_BUFFER_ALLOCATION_SIZE, ringProfile);
+     return true;
+@@ -187,6 +196,32 @@
+                 int64_t previous = lastLowOverflowLogMs.load();
+                 if (nowMs - previous >= 5000 && lastLowOverflowLogMs.compare_exchange_strong(previous, nowMs)) {
+                     LOGE("Low ring remained full after 30ms; evicted one bounded 10ms frame (%zu samples)", drop_samples);
++                }
++                break;
++            } else if (custom_buffer_profile.load() && !golden_ultra_low_profile.load()) {
++                // Custom is continuity-first within the user's selected reserve.
++                // Wait for a longer capture/reader scheduling gap, then evict only
++                // one 10ms oldest frame so latency cannot grow without a bound.
++                const auto waitStatus = ring_not_full.wait_for(lk, std::chrono::milliseconds(60));
++                capacity = active_ring_buffer_capacity;
++                if (waitStatus != std::cv_status::timeout ||
++                    !custom_buffer_profile.load() || golden_ultra_low_profile.load() ||
++                    high_buffer_profile.load() || medium_buffer_profile.load() ||
++                    low_buffer_profile.load() || ring_used < capacity) {
++                    continue;
++                }
++                const size_t drop_samples = std::min<size_t>(BASE_BUFFER_SIZE, ring_used);
++                ring_read_pos = (ring_read_pos + drop_samples) % capacity;
++                ring_used -= drop_samples;
++                packets_dropped++;
++                const uint64_t events = ++custom_buffer_ring_drops;
++                static std::atomic<int64_t> lastCustomOverflowLogMs{0};
++                const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
++                    std::chrono::steady_clock::now().time_since_epoch()).count();
++                int64_t previous = lastCustomOverflowLogMs.load();
++                if (nowMs - previous >= 5000 && lastCustomOverflowLogMs.compare_exchange_strong(previous, nowMs)) {
++                    LOGE("Custom ring full after 60ms; evicted one 10ms frame (events=%llu, target=%dms)",
++                         static_cast<unsigned long long>(events), custom_buffer_target_ms.load());
+                 }
+                 break;
+             } else if (medium_buffer_profile.load() && !golden_ultra_low_profile.load()) {
+@@ -273,14 +308,16 @@
+         return 0;
+     }
+ 
+-    // Golden's original 10ms read remains unchanged. High waits 200ms, Medium
+-    // 35ms, Low 30ms to absorb short jitter bursts, and Custom retains 15ms.
++    // Golden keeps its original 10ms read. Low waits 30ms, Medium 35ms,
++    // High 200ms; Custom gets a modest 20ms gap tolerance while its main
++    // jitter reserve lives in the native ring rather than the hardware track.
+     const auto read_wait = golden_ultra_low_profile.load()
+             ? std::chrono::milliseconds(10)
+             : (high_buffer_profile.load() ? std::chrono::milliseconds(200)
+                : (medium_buffer_profile.load() ? std::chrono::milliseconds(35)
+                   : (low_buffer_profile.load() ? std::chrono::milliseconds(30)
+-                                               : std::chrono::milliseconds(15))));
++                     : (custom_buffer_profile.load() ? std::chrono::milliseconds(20)
++                                                      : std::chrono::milliseconds(15)))));
+     const bool ready = ring_not_empty.wait_for(
+             lk,
+             read_wait,
+@@ -786,6 +823,7 @@
+             high_buffer_profile.store(false);
+             medium_buffer_profile.store(false);
+             low_buffer_profile.store(false);
++            custom_buffer_profile.store(false);
+         }
+         golden_ultra_low_profile.store(requested);
+         active_ring_buffer_capacity = requested_capacity;
+@@ -857,6 +895,7 @@
+             if (requested) {
+                 medium_buffer_profile.store(false);
+                 low_buffer_profile.store(false);
++                custom_buffer_profile.store(false);
+             }
+             high_buffer_profile.store(requested);
+         }
+@@ -928,7 +967,10 @@
+                 ring_read_pos = ring_write_pos = ring_used = 0;
+             }
+             active_ring_buffer_capacity = requested_capacity;
+-            if (requested) low_buffer_profile.store(false);
++            if (requested) {
++                low_buffer_profile.store(false);
++                custom_buffer_profile.store(false);
++            }
+             medium_buffer_profile.store(requested);
+         }
+     }
+@@ -996,7 +1038,10 @@
+                 ring_read_pos = ring_write_pos = ring_used = 0;
+             }
+             active_ring_buffer_capacity = requested_capacity;
+-            if (requested) medium_buffer_profile.store(false);
++            if (requested) {
++                medium_buffer_profile.store(false);
++                custom_buffer_profile.store(false);
++            }
+             low_buffer_profile.store(requested);
+         }
+     }
+@@ -1028,6 +1073,86 @@
+     return JNI_TRUE;
+ }
+ 
++
++JNIEXPORT jboolean JNICALL
++Java_com_example_wifiaudiospeaker_AudioStreamingService_nativeServiceSetCustomBufferProfile(
++        JNIEnv *env, jclass clazz, jboolean enabled, jint targetMs) {
++    const int safeTargetMs = std::max(10, std::min(2000, static_cast<int>(targetMs)));
++    custom_buffer_target_ms.store(safeTargetMs);
++    const bool requested = (enabled == JNI_TRUE) &&
++            !golden_ultra_low_profile.load() && !high_buffer_profile.load() &&
++            !medium_buffer_profile.load() && !low_buffer_profile.load();
++    const size_t requested_capacity = golden_ultra_low_profile.load()
++            ? GOLDEN_ULTRA_LOW_RING_BUFFER_SIZE
++            : (high_buffer_profile.load() ? HIGH_BUFFER_RING_BUFFER_SIZE
++               : (medium_buffer_profile.load() ? MEDIUM_BUFFER_RING_BUFFER_SIZE
++                  : (low_buffer_profile.load() ? LOW_BUFFER_RING_BUFFER_SIZE
++                     : (requested ? custom_ring_capacity_for_target_ms(safeTargetMs) : RING_BUFFER_SIZE))));
++
++    {
++        std::lock_guard<std::mutex> lock(ring_buffer_mutex);
++        const size_t old_capacity = active_ring_buffer_capacity;
++        const size_t old_used = ring_used;
++        const bool old_profile = custom_buffer_profile.load();
++        if (old_profile != requested || old_capacity != requested_capacity) {
++            if (ring_buffer && old_used > 0 && old_capacity > 0) {
++                const size_t keep = std::min(old_used, requested_capacity);
++                const size_t skip = old_used - keep;
++                std::vector<int16_t> preserved(keep);
++                const size_t start = (ring_read_pos + skip) % old_capacity;
++                const size_t first = std::min(keep, old_capacity - start);
++                memcpy(preserved.data(), ring_buffer + start, first * sizeof(int16_t));
++                if (first < keep) {
++                    memcpy(preserved.data() + first, ring_buffer, (keep - first) * sizeof(int16_t));
++                }
++                memcpy(ring_buffer, preserved.data(), keep * sizeof(int16_t));
++                ring_read_pos = 0;
++                ring_used = keep;
++                ring_write_pos = keep % requested_capacity;
++            } else {
++                ring_read_pos = ring_write_pos = ring_used = 0;
++            }
++            active_ring_buffer_capacity = requested_capacity;
++        }
++        if (requested) {
++            golden_ultra_low_profile.store(false);
++            high_buffer_profile.store(false);
++            medium_buffer_profile.store(false);
++            low_buffer_profile.store(false);
++        }
++        custom_buffer_profile.store(requested);
++    }
++
++    if (tcp_socket >= 0 && !golden_ultra_low_profile.load()) {
++        const int requestedSocketBytes = requested ? (256 * 1024) :
++                (high_buffer_profile.load() ? (2 * 1024 * 1024) :
++                 (medium_buffer_profile.load() ? (512 * 1024) :
++                  (low_buffer_profile.load() ? (256 * 1024) : original_socket_receive_buffer_bytes)));
++        setsockopt(tcp_socket, SOL_SOCKET, SO_RCVBUF,
++                   &requestedSocketBytes, sizeof(requestedSocketBytes));
++        int actualSocketBytes = 0;
++        socklen_t actualLength = sizeof(actualSocketBytes);
++        getsockopt(tcp_socket, SOL_SOCKET, SO_RCVBUF,
++                   &actualSocketBytes, &actualLength);
++        LOGI("Custom adaptive profile=%s; target=%dms; native ring=%zu samples (~%zu ms); UDP SO_RCVBUF=%d bytes (requested=%d)",
++             requested ? "ON" : "OFF", safeTargetMs, requested_capacity,
++             requested_capacity * 1000U / static_cast<size_t>(SAMPLE_RATE),
++             actualSocketBytes, requestedSocketBytes);
++    } else {
++        LOGI("Custom adaptive profile=%s; target=%dms; native ring=%zu samples (socket not connected or Golden owns socket)",
++             requested ? "ON" : "OFF", safeTargetMs, requested_capacity);
++    }
++    ring_not_full.notify_all();
++    ring_not_empty.notify_all();
++    return JNI_TRUE;
++}
++
++JNIEXPORT jlong JNICALL
++Java_com_example_wifiaudiospeaker_AudioStreamingService_nativeServiceGetCustomBufferRingDrops(
++        JNIEnv *env, jclass clazz) {
++    return static_cast<jlong>(custom_buffer_ring_drops.load());
++}
++
+ JNIEXPORT jboolean JNICALL
+ Java_com_example_wifiaudiospeaker_AudioStreamingService_nativeServiceGetBufferStats(
+         JNIEnv *env, jclass clazz, jintArray stats) {
+@@ -1117,6 +1242,7 @@
+     packets_received.store(0);
+     packets_dropped.store(0);
+     buffer_underruns.store(0);
++    custom_buffer_ring_drops.store(0);
+ 
+     /* *** Insert await_preroll_samples before main streaming thread starts ***
+     await_preroll_samples(480);  // Wait for 480 samples (≈ 10 ms at 48kHz) to be buffered
+
+--- a/wifi_audio_server.py
++++ b/wifi_audio_server.py
+@@ -381,6 +381,16 @@
+         # named profiles are enabled only after the active Android client announces them.
+         self.client_streaming_profile = "adaptive_v2"
+         self.client_buffer_mode = "medium"
++        self.client_custom_buffer_ms = 500
++        self.custom_capture_queue_drops = 0
++        self.custom_silence_injections = 0
++        self._custom_backlog_since = 0.0
++        self.custom_pc_logical_cores = psutil.cpu_count(logical=True) or 1
++        self.custom_pc_system_cpu_percent = 0.0
++        self.custom_pc_process_cpu_percent = 0.0
++        self.custom_pc_available_memory_mb = 0
++        self._custom_pc_resource_sample_at = 0.0
++        self._custom_pc_process = psutil.Process(os.getpid())
+         self._client_streaming_profile_lock = threading.Lock()
+ 
+         self.right_sidebar_visible = True
+@@ -2737,11 +2747,29 @@
+                     self.log_rate_limited("client_watchdog_error", f"⚠️ Client watchdog error: {e}", 5.0)
+                 time.sleep(1.0)
+ 
+-    def _apply_client_streaming_profile(self, buffer_mode, streaming_profile, client_ip=""):
+-        """Apply the receiver-announced sender profile without changing the PCM packet format."""
++    def _sample_custom_pc_resources(self):
++        """Cheap once-per-second Windows host headroom sample for Custom sender policy."""
++        now = time.monotonic()
++        if now - self._custom_pc_resource_sample_at < 1.0:
++            return
++        self._custom_pc_resource_sample_at = now
++        try:
++            self.custom_pc_system_cpu_percent = float(psutil.cpu_percent(interval=None))
++            process_cpu_raw = float(self._custom_pc_process.cpu_percent(interval=None))
++            self.custom_pc_process_cpu_percent = min(
++                100.0, process_cpu_raw / max(1, self.custom_pc_logical_cores)
++            )
++            self.custom_pc_available_memory_mb = int(psutil.virtual_memory().available // (1024 * 1024))
++        except Exception:
++            # A telemetry-only hardware probe must never stop audio sending.
++            pass
++
++    def _apply_client_streaming_profile(self, buffer_mode, streaming_profile, client_ip="", buffer_ms=500):
++        """Apply the receiver-announced sender profile without changing PCM framing."""
+         mode_key = str(buffer_mode or "").strip().lower()
+         profile_key = str(streaming_profile or "").strip().lower()
+         is_golden = (mode_key == "ultra_low" or profile_key == "golden_ultra_low_v1")
++        is_custom = (mode_key == "custom" or profile_key == "custom_buffer_v1") and not is_golden
+         is_high_continuity = (mode_key == "high" or profile_key == "high_continuity_v1") and not is_golden
+         is_medium_balanced = (
+             (mode_key == "medium" or profile_key == "medium_balanced_v1")
+@@ -2751,11 +2779,13 @@
+             (mode_key == "low" or profile_key == "low_lipsync_v1")
+             and not is_golden and not is_high_continuity and not is_medium_balanced
+         )
++        is_custom = is_custom and not is_high_continuity and not is_medium_balanced and not is_low_lipsync
+         selected_profile = (
+             "golden_ultra_low_v1" if is_golden else
+             "high_continuity_v1" if is_high_continuity else
+             "medium_balanced_v1" if is_medium_balanced else
+-            "low_lipsync_v1" if is_low_lipsync else "adaptive_v2"
++            "low_lipsync_v1" if is_low_lipsync else
++            "custom_buffer_v1" if is_custom else "adaptive_v2"
+         )
+         selected_mode = mode_key or ("ultra_low" if is_golden else "unknown")
+         target_queue_size = (
+@@ -2764,6 +2794,8 @@
+             32 if is_medium_balanced else
+             16 if is_low_lipsync else 12
+         )
++        safe_custom_ms = max(10, min(2000, int(buffer_ms or 500)))
++        self.client_custom_buffer_ms = safe_custom_ms
+ 
+         with self._client_streaming_profile_lock:
+             if (
+@@ -2779,6 +2811,7 @@
+             self.buffer_queue_size = target_queue_size
+             self._medium_backlog_since = 0.0
+             self._low_backlog_since = 0.0
++            self._custom_backlog_since = 0.0
+ 
+             # Keep queue size and sender trimming profile-specific. Low is a short
+             # 160ms queue; Medium is a 320ms burst cushion; High preserves audio.
+@@ -2803,6 +2836,7 @@
+                 + (" | High continuity: no stale-frame trim; no synthetic silence on capture gaps" if is_high_continuity else "")
+                 + (" | Medium balanced: 32-frame burst cushion; sustained backlog trim only" if is_medium_balanced else "")
+                 + (" | Low lip-sync: 16-frame queue; 250ms sustained trim guard" if is_low_lipsync else "")
++                + (f" | Custom adaptive: {safe_custom_ms}ms user target; 12-frame capture queue; sustained trim guard" if is_custom else "")
+                 + (f" | client={client_ip}" if client_ip else "")
+             )
+ 
+@@ -2896,6 +2930,14 @@
+                 streaming_profile = str(obj.get("streaming_profile", "")).strip().lower()
+                 sync_score = as_int(obj, "sync_score", 0)
+                 low_lipsync_skipped_blocks = as_int(obj, "low_lipsync_skipped_blocks", 0)
++                custom_buffer_ms = as_int(obj, "custom_buffer_ms", buffer_ms or 500)
++                custom_effective_ms = as_int(obj, "custom_effective_ms", 0)
++                custom_network_margin_ms = as_int(obj, "custom_network_margin_ms", 0)
++                custom_device_penalty_ms = as_int(obj, "custom_device_penalty_ms", 0)
++                custom_low_watermark_ms = as_int(obj, "custom_low_watermark_ms", 0)
++                custom_high_watermark_ms = as_int(obj, "custom_high_watermark_ms", 0)
++                custom_stale_blocks_skipped = as_int(obj, "custom_stale_blocks_skipped", 0)
++                custom_native_ring_drops = as_int(obj, "custom_native_ring_drops", -1)
+ 
+                 # A phone sends telemetry from a different UDP source port than
+                 # the audio target, so correlate by active client IP, not port.
+@@ -2904,7 +2946,8 @@
+                     self._apply_client_streaming_profile(
+                         buffer_mode,
+                         streaming_profile,
+-                        client_ip=addr[0]
++                        client_ip=addr[0],
++                        buffer_ms=custom_buffer_ms
+                     )
+ 
+                 self.last_client_telemetry_conn = conn
+@@ -2926,6 +2969,17 @@
+                 if state_key != previous_state or now - last_log_at >= 5.0:
+                     self._telemetry_log_states[client_ip] = state_key
+                     self._telemetry_log_times[client_ip] = now
++                    custom_diag = (
++                        f" CUSTOM_TARGET={custom_buffer_ms} CUSTOM_EFFECTIVE={custom_effective_ms} "
++                        f"CUSTOM_NET_MARGIN={custom_network_margin_ms} CUSTOM_DEVICE_PENALTY={custom_device_penalty_ms} "
++                        f"CUSTOM_LOW={custom_low_watermark_ms} CUSTOM_HIGH={custom_high_watermark_ms} "
++                        f"CUSTOM_SKIP={custom_stale_blocks_skipped} CUSTOM_RING_DROP={custom_native_ring_drops} "
++                        f"CUSTOM_QDROP={self.custom_capture_queue_drops} CUSTOM_SILENCE={self.custom_silence_injections} "
++                        f"PC_CORES={self.custom_pc_logical_cores} PC_CPU={self.custom_pc_system_cpu_percent:.0f}% "
++                        f"PC_PROC_CPU={self.custom_pc_process_cpu_percent:.0f}% PC_RAM_AVAIL={self.custom_pc_available_memory_mb}MB "
++                        f"PC_BACKEND={getattr(self, 'current_backend', None) or 'UNKNOWN'}"
++                        if buffer_mode.lower() == "custom" or streaming_profile == "custom_buffer_v1" else ""
++                    )
+                     self.log(
+                         f"📡 Telemetry from {addr[0]} → "
+                         f"Q={q}, RTT={rtt:.0f}ms, Jitter={jit:.1f}ms, RSSI={rssi} | "
+@@ -2938,6 +2992,7 @@
+                         f"LOW_SKIP={low_lipsync_skipped_blocks} "
+                         f"SERVER_LOW_QDROP={self.low_capture_queue_drops} "
+                         f"LOW_SILENCE={self.low_silence_injections}"
++                        f"{custom_diag}"
+                     )
+ 
+             except socket.timeout:
+@@ -3249,9 +3304,62 @@
+                         elif sleep_time < -0.05:
+                             next_frame_time = now
+                         next_frame_time += frame_duration
++                elif active_profile == "custom_buffer_v1":
++                    # Custom has its own continuity-first sender policy. Keep the
++                    # source queue short (12 frames) so the receiver's selected PCM
++                    # reserve, not a second large server queue, controls user latency.
++                    self._sample_custom_pc_resources()
++                    pc_under_pressure = (
++                        self.custom_pc_system_cpu_percent >= 90.0
++                        or self.custom_pc_process_cpu_percent >= 85.0
++                        or (self.custom_pc_available_memory_mb > 0 and self.custom_pc_available_memory_mb < 512)
++                        or self.custom_pc_logical_cores <= 4
++                    )
++                    custom_backlog_guard_s = 0.18 if pc_under_pressure else 0.30
++                    custom_backlog_target_depth = 6 if pc_under_pressure else 8
++                    now = time.perf_counter()
++                    if next_frame_time > now:
++                        self._pace_until(next_frame_time)
++                    send_now = time.perf_counter()
++                    if send_now > next_frame_time:
++                        next_frame_time = send_now
++                    try:
++                        data = self.audio_buffer_queue.get(timeout=max(frame_duration * 2.5, 0.025))
++                        backlog = self.audio_buffer_queue.qsize()
++                        if backlog >= 10:
++                            if not self._custom_backlog_since:
++                                self._custom_backlog_since = time.monotonic()
++                            elif time.monotonic() - self._custom_backlog_since >= custom_backlog_guard_s:
++                                dropped = 0
++                                target_depth = custom_backlog_target_depth
++                                while self.audio_buffer_queue.qsize() > target_depth:
++                                    try:
++                                        self.audio_buffer_queue.get_nowait()
++                                        dropped += 1
++                                    except queue.Empty:
++                                        break
++                                self._custom_backlog_since = 0.0
++                                if dropped:
++                                    self.custom_capture_queue_drops += dropped
++                                    self.log_rate_limited(
++                                        "custom_sustained_backlog_trim",
++                                        f"🧠 Custom sustained source backlog: trimmed {dropped} stale frame(s); retained {target_depth} (~80ms)",
++                                        5.0,
++                                    )
++                        else:
++                            self._custom_backlog_since = 0.0
++                        mono_data = self._convert_to_mono_samples(data, frame_samples)
++                    except queue.Empty:
++                        self._custom_backlog_since = 0.0
++                        mono_data = np.zeros(frame_samples, dtype=np.int16)
++                        self.silence_injections += 1
++                        self.custom_silence_injections += 1
++                    next_frame_time = max(
++                        next_frame_time + frame_duration,
++                        send_now + frame_duration
++                    )
+                 else:
+-                    # Existing adaptive_v2 sender remains for Custom/legacy modes;
+-                    # its original timing and anti-burst trimming are left unchanged.
++                    # Generic adaptive_v2 remains for legacy/unknown clients only.
+                     now = time.perf_counter()
+                     if next_frame_time > now:
+                         self._pace_until(next_frame_time)
+@@ -3671,8 +3779,20 @@
+                                     )
+                                 except queue.Empty:
+                                     pass
++                            elif active_mode == "custom":
++                                try:
++                                    self.audio_buffer_queue.get_nowait()
++                                    self.audio_buffer_queue.put_nowait(mono_data)
++                                    self.custom_capture_queue_drops += 1
++                                    self.log_rate_limited(
++                                        "custom_capture_queue_full_pyaudio",
++                                        f"🧠 Custom WASAPI/PyAudio queue full; replaced oldest frame (events={self.custom_capture_queue_drops})",
++                                        5.0,
++                                    )
++                                except queue.Empty:
++                                    pass
+                             else:
+-                                # Low/Custom retain their existing adaptive queue policy.
++                                # Unknown/legacy adaptive policy only.
+                                 try:
+                                     self.audio_buffer_queue.get_nowait()
+                                     self.audio_buffer_queue.put_nowait(mono_data)
+@@ -3765,6 +3885,9 @@
+                             elif active_mode == "low":
+                                 self.low_capture_queue_drops += 1
+                                 self.log_rate_limited("low_capture_queue_full_sd", f"🎯 Low capture queue full; replaced oldest frame (events={self.low_capture_queue_drops})", 5.0)
++                            elif active_mode == "custom":
++                                self.custom_capture_queue_drops += 1
++                                self.log_rate_limited("custom_capture_queue_full_sd", f"🧠 Custom capture queue full; replaced oldest frame (events={self.custom_capture_queue_drops})", 5.0)
+                             else:
+                                 self.buffer_underruns += 1
+                         except queue.Empty:
+@@ -3874,6 +3997,18 @@
+                                     )
+                                 except queue.Empty:
+                                     pass
++                            elif active_mode == "custom":
++                                try:
++                                    self.audio_buffer_queue.get_nowait()
++                                    self.audio_buffer_queue.put_nowait(mono_int16)
++                                    self.custom_capture_queue_drops += 1
++                                    self.log_rate_limited(
++                                        "custom_capture_queue_full_soundcard",
++                                        f"🧠 Custom SoundCard capture queue full; replaced oldest frame (events={self.custom_capture_queue_drops})",
++                                        5.0,
++                                    )
++                                except queue.Empty:
++                                    pass
+                             else:
+                                 self.buffer_underruns += 1
+                             

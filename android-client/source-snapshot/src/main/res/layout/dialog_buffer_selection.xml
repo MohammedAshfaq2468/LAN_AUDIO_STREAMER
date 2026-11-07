@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:fillViewport="true"
+    android:background="@drawable/gradient_background">
+
+    <androidx.cardview.widget.CardView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_margin="8dp"
+        app:cardCornerRadius="14dp"
+        app:cardElevation="4dp">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:padding="18dp">
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Choose Buffer Mode"
+                android:textSize="21sp"
+                android:textStyle="bold"
+                android:layout_marginBottom="6dp" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Smaller buffers reduce delay; larger buffers can ride through brief network jitter. Test each mode on your route."
+                android:textSize="13sp"
+                android:alpha="0.75"
+                android:layout_marginBottom="12dp" />
+
+            <RadioGroup
+                android:id="@+id/rgBufferModeDialog"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical">
+
+                <RadioButton
+                    android:id="@+id/rbBufferLowDialog"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="Low buffer · 10 ms"
+                    android:textSize="16sp"
+                    android:paddingTop="4dp"
+                    android:paddingBottom="2dp" />
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="36dp"
+                    android:layout_marginBottom="10dp"
+                    android:text="Best for gaming and video when the connection is stable; most sensitive to jitter."
+                    android:textSize="12sp"
+                    android:alpha="0.72" />
+
+                <RadioButton
+                    android:id="@+id/rbBufferMediumDialog"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="Medium buffer · 250 ms"
+                    android:textSize="16sp"
+                    android:paddingTop="4dp"
+                    android:paddingBottom="2dp" />
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="36dp"
+                    android:layout_marginBottom="10dp"
+                    android:text="A balanced starting point for everyday listening and mixed network conditions."
+                    android:textSize="12sp"
+                    android:alpha="0.72" />
+
+                <RadioButton
+                    android:id="@+id/rbBufferHighDialog"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="High buffer · 1500 ms"
+                    android:textSize="16sp"
+                    android:paddingTop="4dp"
+                    android:paddingBottom="2dp" />
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="36dp"
+                    android:layout_marginBottom="10dp"
+                    android:text="More protection against hiccups for music, with noticeably more playback delay."
+                    android:textSize="12sp"
+                    android:alpha="0.72" />
+
+                <RadioButton
+                    android:id="@+id/rbBufferCustomDialog"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="Custom buffer"
+                    android:textSize="16sp"
+                    android:paddingTop="4dp"
+                    android:paddingBottom="2dp" />
+            </RadioGroup>
+
+            <EditText
+                android:id="@+id/etCustomBufferMsDialog"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:hint="Custom buffer in milliseconds (10–2000)"
+                android:inputType="number"
+                android:maxLength="4"
+                android:singleLine="true"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/tvCustomBufferHintDialog"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Custom values are applied to the Android receiver's jitter buffer."
+                android:textSize="12sp"
+                android:alpha="0.7"
+                android:visibility="gone"
+                android:layout_marginTop="4dp" />
+
+        </LinearLayout>
+    </androidx.cardview.widget.CardView>
+</ScrollView>

@@ -1,0 +1,15 @@
+# Core UI, audio processing, and system telemetry
+numpy
+psutil
+PySide6
+Pillow
+qrcode[pil]
+
+# Audio capture backends (at least one supported backend is required)
+PyAudioWPatch
+sounddevice
+soundcard
+
+# Optional Windows integration for master mute and media-session controls
+pycaw
+winsdk

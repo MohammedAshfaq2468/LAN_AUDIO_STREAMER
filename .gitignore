@@ -1,0 +1,47 @@
+# Android / Gradle
+.gradle/
+**/build/
+local.properties
+*.iml
+.idea/
+.cxx/
+.externalNativeBuild/
+
+# Android packages and signing material
+*.apk
+*.aab
+*.ap_
+*.jks
+*.keystore
+keystore.properties
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+
+# Windows / editor
+Thumbs.db
+Desktop.ini
+.vscode/
+*.user
+*.suo
+
+# Logs, private diagnostics, and machine-specific exports
+*.log
+*logcat*
+*Logcat*
+*instant-run-test*
+*run-test*
+*.pcap
+*.etl
+local-config.*
+
+# Build outputs and archives
+/dist/
+/release/
+*.zip
+*.7z

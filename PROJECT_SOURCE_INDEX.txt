@@ -1,0 +1,31 @@
+Curated source snapshot assembled 2026-11-07 from these available workspace files:
+
+Android Kotlin:
+- AudioStreamingService (2026-11-01 19:03:57)
+- MainActivity (2026-11-01 19:03:57)
+- SettingsActivity (2026-11-01 19:03:59)
+- SetupActivity (workspace snapshot: SetupActivity(10).kt; no source timestamp available)
+- SplashActivity (workspace snapshot: SplashActivity(9).kt; no source timestamp available)
+- CustomScannerActivity (2026-10-21 10:07:31)
+- DeviceNameHelper (2026-10-20 20:23:54)
+- MyApplication (2026-10-20 14:38:41)
+- BufferModeConfig (workspace snapshot: BufferModeConfig(5).kt; no source timestamp available)
+
+Android native:
+- wifi_audio_native.cpp (2026-11-01 19:04:03)
+- network_handler.cpp (2026-11-01 15:53:00)
+- audio_processor.cpp (2026-11-01 14:10:46)
+- CMakeLists.txt (workspace snapshot: CMakeLists(1).txt)
+
+Windows server:
+- wifi_audio_server.py (2026-11-01 19:04:12)
+
+Selected XML layouts:
+- activity_main.xml (2026-11-01 10:56:11)
+- activity_settings.xml (2026-11-01 10:56:11)
+- dialog_buffer_selection.xml (from AudioStreamingAPP_Four_Buffer_UI snapshot)
+
+Experimental Custom candidate:
+- Files copied from AudioStreamingAPP_Custom_Adaptive_Engine bundle; not merged into baseline and not device-validated.
+
+No original Gradle files, Gradle wrapper, AndroidManifest.xml, complete resources, raw device logs, screenshots, APKs, or signing material were available/included.
