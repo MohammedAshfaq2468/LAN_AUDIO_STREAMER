@@ -1,4 +1,4 @@
-# Wi-Fi Audio Speaker
+# LAN_AUDIO_STREAMER
 
 **Android client + Windows desktop audio sender**  
 **Project author:** Mohammed Ashfaq  
